@@ -29,9 +29,10 @@ import pandas as pd
 import warnings
 warnings.filterwarnings('ignore')
 
+import statsmodels.api as sm
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import GridSearchCV, cross_val_score
+from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 from scipy import stats
@@ -99,33 +100,25 @@ def fit_linear(land_df):
 # 3. Random Forest + GridSearchCV
 # ---------------------------------------------------------------------------
 
-# Coarser grid than script 03 — 180k samples makes exhaustive search slow
-RF_GRID = {
-    'n_estimators':     [100, 300],
-    'max_depth':        [None, 20],
-    'min_samples_leaf': [2, 5],
-    'max_features':     ['sqrt', 'log2'],
-}
+# Fixed config matching 03_constraint_analysis best params (cross-validated on GlaThiDa land set).
+# Using the same configuration for both analyses ensures the land baselines are comparable.
+RF_PARAMS = dict(
+    n_estimators=500, max_depth=10, min_samples_leaf=5,
+    max_features='log2', random_state=SEED, n_jobs=-1,
+)
 
 def fit_random_forest(land_df):
-    print('\n--- Random Forest + GridSearchCV ---')
+    print('\n--- Random Forest (fixed config, matching 03_constraint_analysis) ---')
     X = land_df[FEATURES].values
     y = land_df[LABEL].values
 
-    gs = GridSearchCV(
-        RandomForestRegressor(random_state=SEED, n_jobs=-1),
-        RF_GRID,
-        cv=3,
-        scoring='neg_mean_absolute_error',
-        n_jobs=-1,
-        verbose=1,
-    )
-    gs.fit(X, y)
-
-    best_mae = -gs.best_score_
-    print(f'  Best params: {gs.best_params_}')
-    print(f'  Best CV MAE: {best_mae:.1f} m')
-    return gs.best_estimator_
+    rf = RandomForestRegressor(**RF_PARAMS)
+    cv_mae = -cross_val_score(rf, X, y, cv=5,
+                              scoring='neg_mean_absolute_error', n_jobs=-1).mean()
+    print(f'  Params: n_estimators=500, max_depth=10, min_samples_leaf=5, max_features=log2')
+    print(f'  5-fold CV MAE: {cv_mae:.1f} m')
+    rf.fit(X, y)
+    return rf
 
 
 # ---------------------------------------------------------------------------
@@ -175,13 +168,36 @@ def fit_hab(df):
     x = df['water_depth_m'].values
     y = df['thickness_excess_m'].values
     slope, intercept, r, p, se = stats.linregress(x, y)
-    print(f'\nHAB linear fit:')
-    print(f'  slope     = {slope:.3f}  (theory ~1.0)')
+    print(f'\nHAB linear fit (OLS):')
+    print(f'  slope     = {slope:.4f}  (theory ~1.0)')
     print(f'  intercept = {intercept:.1f} m')
     print(f'  R²        = {r**2:.3f}')
     print(f'  p         = {p:.2e}')
     print(f'  n         = {len(df):,}')
     return slope, intercept, r, p
+
+
+def fit_hab_clustered(df):
+    """Cluster-robust OLS clustered by RGI 2-digit region."""
+    df = df.copy()
+    df['rgi_region'] = df['RGIId'].str[6:8]
+    n_clusters = df['rgi_region'].nunique()
+
+    X = sm.add_constant(df['water_depth_m'].values)
+    y = df['thickness_excess_m'].values
+    ols = sm.OLS(y, X).fit()
+    robust = ols.get_robustcov_results(cov_type='cluster',
+                                       groups=df['rgi_region'].values)
+
+    print(f'\n--- Cluster-robust regression (k={n_clusters} RGI regions) ---')
+    print(f'  OLS:            slope={ols.params[1]:.4f}, SE={ols.bse[1]:.4f}, '
+          f'p={ols.pvalues[1]:.4e}')
+    print(f'  Cluster-robust: slope={robust.params[1]:.4f}, SE={robust.bse[1]:.4f}, '
+          f'p={robust.pvalues[1]:.4e}')
+    print(f'  Cluster-robust 95% CI: [{robust.conf_int()[1,0]:.4f}, '
+          f'{robust.conf_int()[1,1]:.4f}]')
+    print(f'  Regions present: {sorted(df["rgi_region"].unique())}')
+    return robust
 
 
 def bin_by_depth(df):
@@ -215,11 +231,15 @@ if __name__ == '__main__':
     water_df    = compute_excess(rf_model, water_df)
     df          = join_depths(water_df)
     slope, intercept, r, p = fit_hab(df)
+    robust = fit_hab_clustered(df)
     df, summary = bin_by_depth(df)
 
     df.attrs.update({
         'hab_slope': slope, 'hab_intercept': intercept,
         'hab_r2': r**2, 'hab_p': p,
+        'hab_slope_clustered': robust.params[1],
+        'hab_p_clustered': robust.pvalues[1],
+        'hab_se_clustered': robust.bse[1],
     })
 
     df.to_pickle(ANALYSIS_OUT)
